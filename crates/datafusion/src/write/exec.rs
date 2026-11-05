@@ -38,13 +38,15 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use iceberg::arrow::FieldMatchMode;
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, StructType, write_data_files_to_avro,
+    DataFile, DataFileFormat, FormatVersion, PartitionKey, StructType, TableMetadata,
+    write_data_files_to_avro,
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
+    ObjectStorageLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use uuid::Uuid;
@@ -276,8 +278,7 @@ impl ExecutionPlan for IcebergWriteExec {
             .map_err(to_datafusion_error)?;
 
         let file_io = self.table.file_io().clone();
-        // todo location_gen and file_name_gen should be configurable
-        let location_generator = DefaultLocationGenerator::new(self.table.metadata())
+        let location_generator = TableLocationGenerator::try_new(self.table.metadata())
             .map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
@@ -332,6 +333,42 @@ impl ExecutionPlan for IcebergWriteExec {
             Arc::clone(&self.result_schema),
             stream,
         )))
+    }
+}
+
+/// Places data files in the layout selected by the table property
+/// `write.object-storage.enabled`.
+#[derive(Clone, Debug)]
+enum TableLocationGenerator {
+    Default(DefaultLocationGenerator),
+    ObjectStorage(ObjectStorageLocationGenerator),
+}
+
+impl TableLocationGenerator {
+    fn try_new(metadata: &TableMetadata) -> iceberg::Result<Self> {
+        let generator = if metadata.table_properties().write_object_storage_enabled()? {
+            Self::ObjectStorage(ObjectStorageLocationGenerator::new(metadata)?)
+        } else {
+            Self::Default(DefaultLocationGenerator::new(metadata)?)
+        };
+        Ok(generator)
+    }
+}
+
+impl LocationGenerator for TableLocationGenerator {
+    fn generate_location(
+        &self,
+        partition_key: Option<&PartitionKey>,
+        file_name: &str,
+    ) -> String {
+        match self {
+            Self::Default(generator) => {
+                generator.generate_location(partition_key, file_name)
+            }
+            Self::ObjectStorage(generator) => {
+                generator.generate_location(partition_key, file_name)
+            }
+        }
     }
 }
 
