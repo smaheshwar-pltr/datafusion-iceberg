@@ -41,12 +41,7 @@ use iceberg::spec::{
     DataFile, DataFileFormat, FormatVersion, StructType, write_data_files_to_avro,
 };
 use iceberg::table::Table;
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, TableLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 use uuid::Uuid;
 
 use super::task_writer::TaskWriter;
@@ -257,38 +252,23 @@ impl ExecutionPlan for IcebergWriteExec {
             );
         }
 
-        // Build the writer from the already-parsed table properties so it honors
-        // `write.parquet.*` settings (e.g. CDC). Arrow batches flowing through
+        // The table's parquet writer builder applies its `write.parquet.*`
+        // properties and encryption manager. Arrow batches flowing through
         // DataFusion carry no field-id metadata, so match fields by name.
-        let mut parquet_file_writer_builder =
-            ParquetWriterBuilder::from_table_properties(
-                &table_props,
-                self.table.metadata().current_schema().clone(),
-            )
+        let parquet_file_writer_builder = self
+            .table
+            .parquet_writer_builder(self.table.current_schema_ref())
             .map_err(to_datafusion_error)?
             .with_match_mode(FieldMatchMode::Name);
-        if let Some(encryption_manager) = self.table.encryption_manager() {
-            parquet_file_writer_builder = parquet_file_writer_builder
-                .with_encryption_manager(encryption_manager.clone());
-        }
-        let target_file_size = table_props
-            .write_target_file_size_bytes()
-            .map_err(to_datafusion_error)?;
-
-        let file_io = self.table.file_io().clone();
-        let location_generator = TableLocationGenerator::new(self.table.metadata())
-            .map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
             DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, file_format);
-        let rolling_writer_builder = RollingFileWriterBuilder::new(
-            parquet_file_writer_builder,
-            target_file_size,
-            file_io,
-            location_generator,
-            file_name_generator,
-        );
-        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        // The table's data file writer builder applies its file IO, target file
+        // size and location layout.
+        let data_file_writer_builder = self
+            .table
+            .data_file_writer_builder(parquet_file_writer_builder, file_name_generator)
+            .map_err(to_datafusion_error)?;
 
         // Create TaskWriter
         let fanout_enabled = table_props

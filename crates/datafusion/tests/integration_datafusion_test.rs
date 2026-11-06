@@ -32,14 +32,16 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
+use iceberg::encryption::kms::MemoryKmsClientFactory;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, TableProperties,
-    Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+    FormatVersion, Literal, NestedField, PrimitiveType, Schema, Struct, StructType,
+    TableProperties, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
@@ -982,6 +984,88 @@ async fn test_insert_into_object_storage_layout_without_partition_paths()
         }
     }
     assert_eq!(file_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_encrypted_table_writes_encrypted_files()
+-> Result<(), Box<dyn Error>> {
+    let kms_client_factory = MemoryKmsClientFactory::new();
+    kms_client_factory.add_master_key("master-key")?;
+    let iceberg_catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .with_kms_client_factory(Arc::new(kms_client_factory))
+        .load(
+            "memory",
+            HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), temp_path())]),
+        )
+        .await?;
+    let namespace = NamespaceIdent::new("ns".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .format_version(FormatVersion::V3)
+        .properties(HashMap::from([(
+            TableProperties::PROPERTY_ENCRYPTION_KEY_ID.to_string(),
+            "master-key".to_string(),
+        )]))
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client
+        .load_table(&TableIdent::new(namespace, "t".to_string()))
+        .await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut file_count = 0;
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            file_count += 1;
+            let data_file = entry.data_file();
+            let path = data_file.file_path();
+            assert!(data_file.key_metadata().is_some(), "{path}");
+            // A reader without the table's keys cannot read the file.
+            let bytes = table.file_io().new_input(path)?.read().await?;
+            let plaintext_read = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .and_then(|builder| builder.build())
+                .map(|reader| reader.collect::<Result<Vec<_>, _>>());
+            assert!(
+                !matches!(plaintext_read, Ok(Ok(_))),
+                "{path} is readable without decryption"
+            );
+        }
+    }
+    assert!(file_count > 0);
+
+    // The table still reads its own rows.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.ns.t")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
     Ok(())
 }
