@@ -38,8 +38,8 @@ use datafusion::physical_plan::common::collect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
-    UnboundPartitionField, UnboundPartitionSpec,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, TableProperties,
+    Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
@@ -891,6 +891,97 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_object_storage_layout_without_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("ns".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .build();
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::from([
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS
+                    .to_string(),
+                "false".to_string(),
+            ),
+        ]))
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client
+        .load_table(&TableIdent::new(namespace, "t".to_string()))
+        .await?;
+    let data_location = format!("{}/data/", table.metadata().location());
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut file_count = 0;
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            file_count += 1;
+            let path = entry.data_file().file_path();
+            // `{data location}/{4}/{4}/{4}/{8}-{file name}`, where `{n}` is n
+            // binary digits of hash entropy, and no partition path.
+            let relative = path
+                .strip_prefix(&data_location)
+                .unwrap_or_else(|| panic!("{path} is not under {data_location}"));
+            let segments = relative.split('/').collect::<Vec<_>>();
+            assert_eq!(segments.len(), 4, "{path}");
+            let (last_entropy, file_name) = segments[3]
+                .split_once('-')
+                .unwrap_or_else(|| panic!("{path}"));
+            for (entropy, len) in [segments[0], segments[1], segments[2], last_entropy]
+                .into_iter()
+                .zip([4, 4, 4, 8])
+            {
+                assert_eq!(entropy.len(), len, "{path}");
+                assert!(entropy.chars().all(|c| c == '0' || c == '1'), "{path}");
+            }
+            assert!(file_name.ends_with(".parquet"), "{path}");
+            assert!(!path.contains("category="), "{path}");
+        }
+    }
+    assert_eq!(file_count, 2);
 
     Ok(())
 }
