@@ -38,10 +38,15 @@ use datafusion::physical_plan::common::collect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
-    UnboundPartitionField, UnboundPartitionSpec,
+    DataFile, Literal, NestedField, PartitionKey, PrimitiveType, Schema, Struct,
+    StructType, TableProperties, Transform, Type, UnboundPartitionField,
+    UnboundPartitionSpec,
 };
+use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+use iceberg::writer::file_writer::location_generator::{
+    LocationGenerator, ObjectStorageLocationGenerator,
+};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
@@ -893,6 +898,129 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_object_storage_layout_without_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let (table, data_files) = insert_into_partitioned_table(&[
+        (
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            "true",
+        ),
+        (
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
+            "false",
+        ),
+    ])
+    .await?;
+
+    let location_generator = ObjectStorageLocationGenerator::new(table.metadata())?;
+    assert_eq!(data_files.len(), 2);
+    for data_file in data_files {
+        let path = data_file.file_path();
+        // Without partition paths, the last entropy directory and the file name are
+        // joined with `-`, and the location doesn't depend on the partition.
+        let (_, file_name) = path.rsplit_once('/').unwrap().1.split_once('-').unwrap();
+        assert_eq!(path, location_generator.generate_location(None, file_name));
+        assert!(!path.contains("category="), "{path}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_object_storage_layout_with_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let (table, data_files) = insert_into_partitioned_table(&[(
+        TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+        "true",
+    )])
+    .await?;
+
+    let metadata = table.metadata();
+    let location_generator = ObjectStorageLocationGenerator::new(metadata)?;
+    assert_eq!(data_files.len(), 2);
+    for data_file in data_files {
+        let path = data_file.file_path();
+        let (_, file_name) = path.rsplit_once('/').unwrap();
+        let partition_key = PartitionKey::new(
+            metadata.default_partition_spec().as_ref().clone(),
+            metadata.current_schema().clone(),
+            data_file.partition().clone(),
+        );
+        assert_eq!(
+            path,
+            location_generator.generate_location(Some(&partition_key), file_name)
+        );
+    }
+
+    Ok(())
+}
+
+/// Creates a table with `properties`, identity-partitioned on `category`, inserts a row
+/// into each of two partitions, and returns the table and the data files it committed.
+async fn insert_into_partitioned_table(
+    properties: &[(&str, &str)],
+) -> Result<(Table, Vec<DataFile>), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("ns".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .build();
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(
+            properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client
+        .load_table(&TableIdent::new(namespace, "t".to_string()))
+        .await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut data_files = Vec::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            data_files.push(entry.data_file().clone());
+        }
+    }
+
+    Ok((table, data_files))
 }
 
 /// Executes `plan`, which must have a single partition, and returns its rows.
