@@ -3191,7 +3191,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=1e13739ac92b7e49cafb1eb12b8a552a2332f510#1e13739ac92b7e49cafb1eb12b8a552a2332f510"
+source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=9740089ccc4114d5a03a8ea37b3dddbd444377e3#9740089ccc4114d5a03a8ea37b3dddbd444377e3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3251,7 +3251,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=1e13739ac92b7e49cafb1eb12b8a552a2332f510#1e13739ac92b7e49cafb1eb12b8a552a2332f510"
+source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=9740089ccc4114d5a03a8ea37b3dddbd444377e3#9740089ccc4114d5a03a8ea37b3dddbd444377e3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3313,7 +3313,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.10.1"
-source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=1e13739ac92b7e49cafb1eb12b8a552a2332f510#1e13739ac92b7e49cafb1eb12b8a552a2332f510"
+source = "git+https://github.com/smaheshwar-pltr/iceberg-rust?rev=9740089ccc4114d5a03a8ea37b3dddbd444377e3#9740089ccc4114d5a03a8ea37b3dddbd444377e3"
 dependencies = [
  "proc-macro2",
  "quote",
