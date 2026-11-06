@@ -278,7 +278,7 @@ impl ExecutionPlan for IcebergWriteExec {
             .map_err(to_datafusion_error)?;
 
         let file_io = self.table.file_io().clone();
-        let location_generator = TableLocationGenerator::try_new(self.table.metadata())
+        let location_generator = TableLocationGenerator::new(self.table.metadata())
             .map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
@@ -336,8 +336,7 @@ impl ExecutionPlan for IcebergWriteExec {
     }
 }
 
-/// Places data files in the layout selected by the table property
-/// `write.object-storage.enabled`.
+/// Places data files in the layout chosen by `write.object-storage.enabled`.
 #[derive(Clone, Debug)]
 enum TableLocationGenerator {
     Default(DefaultLocationGenerator),
@@ -345,7 +344,7 @@ enum TableLocationGenerator {
 }
 
 impl TableLocationGenerator {
-    fn try_new(metadata: &TableMetadata) -> iceberg::Result<Self> {
+    fn new(metadata: &TableMetadata) -> iceberg::Result<Self> {
         let generator = if metadata.table_properties().write_object_storage_enabled()? {
             Self::ObjectStorage(ObjectStorageLocationGenerator::new(metadata)?)
         } else {
