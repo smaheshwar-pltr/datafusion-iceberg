@@ -22,6 +22,7 @@ use datafusion::error::Result;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::spec::Schema;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use tempfile::TempDir;
 
@@ -45,8 +46,25 @@ impl FixtureCatalog {
     /// Creates an empty catalog in a new temporary directory. Its tables' paths
     /// are `file://` URLs, so any storage that reads local files can read them.
     pub async fn try_new() -> Result<Self> {
+        Self::load(MemoryCatalogBuilder::default()).await
+    }
+
+    /// Like [`FixtureCatalog::try_new`], but the catalog's tables get their
+    /// location generators from `location_generator_factory`, so INSERTs write
+    /// data files wherever that factory's generators say.
+    pub async fn try_new_with_location_generator_factory(
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Result<Self> {
+        Self::load(
+            MemoryCatalogBuilder::default()
+                .with_location_generator_factory(location_generator_factory),
+        )
+        .await
+    }
+
+    async fn load(builder: MemoryCatalogBuilder) -> Result<Self> {
         let directory = TempDir::new()?;
-        let catalog = MemoryCatalogBuilder::default()
+        let catalog = builder
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
             .load(
                 "fixture",

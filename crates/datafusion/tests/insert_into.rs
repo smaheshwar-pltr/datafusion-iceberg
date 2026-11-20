@@ -28,12 +28,17 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use iceberg::TableIdent;
 use iceberg::spec::{
-    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, TableProperties,
-    Transform, Type,
+    Literal, NestedField, PartitionKey, PrimitiveType, Schema, Struct, StructType,
+    TableProperties, Transform, Type,
+};
+use iceberg::writer::file_writer::location_generator::{
+    LocationGenerator, LocationGeneratorContext, LocationGeneratorFactory,
+    ResolvingLocationGeneratorFactory, TableLocationGenerator,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_datafusion_test_tools::{FixtureCatalog, data_file_name, display_schema};
 use regex::Regex;
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -578,6 +583,148 @@ async fn test_insert_into_invalid_object_storage_enabled() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// Java's location provider property, which [`ClassNameLocationFactory`] maps to Rust
+/// location generators.
+const JAVA_LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
+
+/// The class name [`ClassNameLocationFactory`] maps to [`PrefixLocationGenerator`].
+const POC_LOCATION_PROVIDER: &str = "org.example.PocLocationProvider";
+
+/// Puts every data file directly under `root`, ignoring the partition.
+#[derive(Clone)]
+struct PrefixLocationGenerator {
+    root: String,
+}
+
+impl LocationGenerator for PrefixLocationGenerator {
+    fn generate_location(&self, _: Option<&PartitionKey>, file_name: &str) -> String {
+        format!("{}/{file_name}", self.root)
+    }
+}
+
+/// Gives tables whose `write.location-provider.impl` is [`POC_LOCATION_PROVIDER`] a
+/// [`PrefixLocationGenerator`] rooted at `{root}/{table identifier}`, and every other
+/// table the built-in layout.
+#[derive(Debug)]
+struct ClassNameLocationFactory {
+    root: String,
+}
+
+impl ClassNameLocationFactory {
+    /// Roots the custom layout at `file://{dir}/poc-factory-prefix`.
+    fn new(dir: &TempDir) -> Self {
+        Self {
+            root: format!("file://{}/poc-factory-prefix", dir.path().display()),
+        }
+    }
+}
+
+impl LocationGeneratorFactory for ClassNameLocationFactory {
+    fn create_location_generator(
+        &self,
+        context: &LocationGeneratorContext<'_>,
+    ) -> iceberg::Result<TableLocationGenerator> {
+        let provider = context
+            .metadata()
+            .properties()
+            .get(JAVA_LOCATION_PROVIDER_IMPL);
+        if provider.map(String::as_str) == Some(POC_LOCATION_PROVIDER) {
+            Ok(TableLocationGenerator::new(PrefixLocationGenerator {
+                root: format!("{}/{}", self.root, context.identifier()),
+            }))
+        } else {
+            ResolvingLocationGeneratorFactory.create_location_generator(context)
+        }
+    }
+}
+
+/// The factory is given only to the catalog builder; `IcebergWriteExec` gets the
+/// generator from `Table::location_generator()` with no DataFusion-specific setup.
+#[tokio::test]
+async fn test_insert_into_custom_location_generator_factory() -> Result<(), Box<dyn Error>>
+{
+    let custom_dir = TempDir::new()?;
+    let fixtures = FixtureCatalog::try_new_with_location_generator_factory(Arc::new(
+        ClassNameLocationFactory::new(&custom_dir),
+    ))
+    .await?;
+    let ctx = create_category_table(
+        &fixtures,
+        &[(JAVA_LOCATION_PROVIDER_IMPL, POC_LOCATION_PROVIDER)],
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let prefix = format!(
+        "file://{}/poc-factory-prefix/ns.t/",
+        custom_dir.path().display()
+    );
+    let paths = data_file_paths(&fixtures).await?;
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    for path in &paths {
+        assert!(
+            path.starts_with(&prefix),
+            "{path} doesn't start with {prefix}"
+        );
+    }
+    // The committed files are readable from where the custom generator put them.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.ns.t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +----+----------+
+    | id | category |
+    +----+----------+
+    | 1  | a        |
+    | 2  | b        |
+    +----+----------+
+    ");
+
+    Ok(())
+}
+
+/// A catalog with a custom factory still gives tables that don't name the custom
+/// provider the built-in layout.
+#[tokio::test]
+async fn test_insert_into_custom_factory_without_provider_uses_builtin_layout()
+-> Result<(), Box<dyn Error>> {
+    let custom_dir = TempDir::new()?;
+    let fixtures = FixtureCatalog::try_new_with_location_generator_factory(Arc::new(
+        ClassNameLocationFactory::new(&custom_dir),
+    ))
+    .await?;
+    let ctx = create_category_table(&fixtures, &[]).await?;
+
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = fixtures
+        .catalog()
+        .load_table(&TableIdent::from_strs(["ns", "t"])?)
+        .await?;
+    let data_dir = format!("{}/data/", table.metadata().location());
+    for path in data_file_paths(&fixtures).await? {
+        assert!(
+            path.starts_with(&data_dir),
+            "{path} doesn't start with {data_dir}"
+        );
+    }
+    assert_eq!(
+        redacted_data_file_paths(&fixtures).await?,
+        ["category=a/<file>", "category=b/<file>"]
+    );
+
+    Ok(())
+}
+
 /// Creates `ns.t (id int, category string)`, identity-partitioned on `category`, with
 /// table `properties`, and returns a session with its catalog registered as `catalog`.
 async fn create_category_table(
@@ -616,6 +763,21 @@ async fn redacted_data_file_paths(
     let hash = Regex::new("^[01]{4}/[01]{4}/[01]{4}/[01]{8}")?;
     let file_name = Regex::new(r"[0-9a-f-]{36}-[0-9]{5}\.parquet$")?;
 
+    let mut paths = Vec::new();
+    for path in data_file_paths(fixtures).await? {
+        let path = hash.replace(data_file_name(&path), "<hash>");
+        paths.push(file_name.replace(&path, "<file>").into_owned());
+    }
+    paths.sort();
+
+    Ok(paths)
+}
+
+/// Returns the full paths of the data files in `ns.t`'s current snapshot, as committed
+/// to its manifests, sorted.
+async fn data_file_paths(
+    fixtures: &FixtureCatalog,
+) -> Result<Vec<String>, Box<dyn Error>> {
     let table = fixtures
         .catalog()
         .load_table(&TableIdent::from_strs(["ns", "t"])?)
@@ -626,9 +788,7 @@ async fn redacted_data_file_paths(
     for entry in manifest_list.entries() {
         let manifest = table.manifest_reader().read(entry).await?;
         for entry in manifest.entries() {
-            let path = data_file_name(entry.data_file().file_path());
-            let path = hash.replace(path, "<hash>");
-            paths.push(file_name.replace(&path, "<file>").into_owned());
+            paths.push(entry.data_file().file_path().to_string());
         }
     }
     paths.sort();

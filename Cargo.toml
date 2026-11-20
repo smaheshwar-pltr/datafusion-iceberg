@@ -47,3 +47,11 @@ tracing = "0.1.41"
 
 [workspace.lints.rust]
 unused_qualifications = "deny"
+
+# Local proof of concept only: build against the iceberg-rust branch
+# df/pin-factory-poc (the pin plus location-generator/2-custom-providers, i.e.
+# Table::location_generator and LocationGeneratorFactory), checked out at this path.
+[patch."https://github.com/apache/iceberg-rust"]
+iceberg = { git = "https://github.com/smaheshwar-pltr/iceberg-rust", branch = "location-generator/df-pin-custom-providers" }
+iceberg-catalog-rest = { git = "https://github.com/smaheshwar-pltr/iceberg-rust", branch = "location-generator/df-pin-custom-providers" }
+iceberg-property-macro = { git = "https://github.com/smaheshwar-pltr/iceberg-rust", branch = "location-generator/df-pin-custom-providers" }
